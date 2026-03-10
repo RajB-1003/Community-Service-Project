@@ -2,40 +2,46 @@
 
 import { useState } from "react";
 import MicButton from "@/components/MicButton";
-import ResultCard from "@/components/ResultCard";
-import Timeline from "@/components/Timeline";
-import DownloadButton from "@/components/DownloadButton";
-import FormCollector from "@/components/FormCollector";
+
 import { Scale } from "lucide-react";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
-interface NyayaResult {
-  intent_detected: string;
-  kill_switch_triggered: boolean;
-  simplified_explanation: string;
-  relevant_acts: string[];
-  immediate_action_steps: string[];
-  extracted_user_issue: string;
-  follow_up_question: string;
-  transcribed_text: string;
-  pdf_url: string;
-  context_source?: string;
-  sources_used?: string[];
+interface Scheme {
+  scheme_name: string;
+  reason: string;
+}
+
+interface Transaction {
+  transaction_type: string;
+  amount: number;
+  category: string;
+}
+
+interface Insights {
+  total_income_logged: number;
+  total_expense_logged: number;
+  debt_risk_flag: boolean;
+  alert_message: string | null;
+  suggested_schemes: Scheme[];
+}
+
+interface FinancialResult {
+  transactions: Transaction[];
+  insights: Insights;
+  transcribed_text?: string;
 }
 
 export default function Home() {
-  const [result, setResult] = useState<NyayaResult | null>(null);
+  const [result, setResult] = useState<FinancialResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [showForm, setShowForm] = useState(false);
   const [inputMode, setInputMode] = useState<"text" | "mic">("text");
   const [textInput, setTextInput] = useState("");
   const [textLoading, setTextLoading] = useState(false);
 
-  const handleResult = (data: NyayaResult) => {
+  const handleResult = (data: FinancialResult) => {
     setErrorMsg(null);
     setResult(data);
-    setShowForm(false);
   };
 
   const handleError = (msg: string) => setErrorMsg(msg);
@@ -43,7 +49,6 @@ export default function Home() {
   const handleReset = () => {
     setResult(null);
     setErrorMsg(null);
-    setShowForm(false);
     setTextInput("");
   };
 
@@ -74,27 +79,21 @@ export default function Home() {
     <main className="min-h-screen bg-gradient-to-b from-slate-50 via-blue-50 to-indigo-100 py-8 px-4">
       <div className="max-w-md mx-auto space-y-6">
 
-        {}
         <header className="text-center space-y-2">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-700 shadow-lg mb-2">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-green-600 to-emerald-700 shadow-lg mb-2">
             <Scale className="w-7 h-7 text-white" />
           </div>
           <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">
-            Project <span className="text-indigo-600">Nyaya</span>
+            Ayyampalayam <span className="text-emerald-600">Economy</span>
           </h1>
           <p className="text-sm text-slate-500 max-w-xs mx-auto leading-relaxed">
-            Speak or type your legal concern — get clear, actionable guidance instantly.
+            Log financial transactions via text or voice, track debt, and find government schemes.
           </p>
-          {/* <div className="inline-block mt-1 px-3 py-0.5 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold ring-1 ring-amber-200">
-            Not legal advice · For information only
-          </div> */}
         </header>
 
-        {}
         {!result && (
           <section className="bg-white rounded-3xl shadow-xl border border-slate-100 py-8 px-6 space-y-5">
 
-            {}
             <div className="flex rounded-xl overflow-hidden border border-slate-200 text-sm font-semibold">
               <button
                 onClick={() => setInputMode("text")}
@@ -118,7 +117,6 @@ export default function Home() {
               </button>
             </div>
 
-            {}
             {inputMode === "text" && (
               <div className="space-y-3">
                 <label className="block text-sm font-semibold text-slate-700">
@@ -159,18 +157,16 @@ export default function Home() {
               </div>
             )}
 
-            {}
             {inputMode === "mic" && (
               <div className="flex flex-col items-center space-y-4">
                 <MicButton onResult={handleResult} onError={handleError} />
                 <p className="text-xs text-slate-400 text-center">
-                  Speak in Hindi, Tamil, Kannada, Telugu, Bengali, or any language.
+                  Speak in Tanglish, Tamil, or English.
                   <br />Whisper will translate automatically.
                 </p>
               </div>
             )}
 
-            {}
             {errorMsg && (
               <div className="bg-red-50 border border-red-200 rounded-xl px-4 py-3">
                 <p className="text-sm text-red-600 font-medium">{errorMsg}</p>
@@ -178,7 +174,7 @@ export default function Home() {
             )}
 
             <div className="flex flex-wrap gap-2 justify-center pt-1">
-              {["RTI Filing", "Domestic Violence", "Mutual Divorce"].map((tag) => (
+              {["Income Parsing", "Debt Risk Alerts", "Scheme Suggestions"].map((tag) => (
                 <span key={tag} className="text-xs bg-slate-100 text-slate-500 rounded-full px-3 py-1 font-medium">
                   {tag}
                 </span>
@@ -187,100 +183,91 @@ export default function Home() {
           </section>
         )}
 
-        {}
         {result && (
           <>
-            <ResultCard
-              intentDetected={result.intent_detected}
-              killSwitchTriggered={result.kill_switch_triggered}
-              simplifiedExplanation={result.simplified_explanation}
-              relevantActs={result.relevant_acts ?? []}
-              immediateActionSteps={result.immediate_action_steps}
-              extractedUserIssue={result.extracted_user_issue}
-              followUpQuestion={result.follow_up_question ?? ""}
-              transcribedText={result.transcribed_text}
-            />
+            <div className="bg-white rounded-3xl shadow-xl border border-slate-100 py-6 px-6 space-y-6">
+              
+              {result.transcribed_text && (
+                <div className="space-y-2">
+                  <h3 className="text-sm font-semibold text-slate-500">Statement</h3>
+                  <p className="text-sm bg-slate-50 p-3 rounded-lg border border-slate-100 text-slate-700 italic">
+                    &quot;{result.transcribed_text}&quot;
+                  </p>
+                </div>
+              )}
 
-            {!result.kill_switch_triggered && (
-              <Timeline intent={result.intent_detected} />
-            )}
+              {result.insights.debt_risk_flag && result.insights.alert_message && (
+                <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded-r-lg">
+                  <h3 className="text-red-800 font-bold mb-1">Debt Risk Alert</h3>
+                  <p className="text-red-700 text-sm">{result.insights.alert_message}</p>
+                </div>
+              )}
 
-            {}
-            {!result.kill_switch_triggered && (
-              <div className="bg-gradient-to-br from-indigo-900 to-blue-900 rounded-2xl p-5 border border-indigo-700 shadow-lg">
-                <div className="flex items-start gap-3">
-                  <div className="text-2xl">🤖</div>
-                  <div className="flex-1">
-                    <h3 className="text-white font-bold text-sm mb-1">
-                      Let the Agent Fill the Form for You
-                    </h3>
-                    <p className="text-indigo-200 text-xs leading-relaxed mb-3">
-                      Pre-fills a{" "}
-                      <strong className="text-white">
-                        {result.intent_detected === "RTI"
-                          ? "RTI Application"
-                          : result.intent_detected === "Domestic Violence"
-                          ? "DV Complaint Letter"
-                          : "Divorce Petition Draft"}
-                      </strong>{" "}
-                      from your statement, asks for missing info, then generates a ready-to-submit PDF.
-                    </p>
-                    <button
-                      id="generate-form-btn"
-                      onClick={() => setShowForm(true)}
-                      className="w-full bg-white text-indigo-800 font-bold text-sm py-2.5 rounded-xl hover:bg-indigo-50 transition-colors"
-                    >
-                      Generate My Filled Document →
-                    </button>
-                  </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-xl text-center">
+                  <p className="text-xs font-semibold text-emerald-600 uppercase tracking-wide">Total Income</p>
+                  <p className="text-2xl font-bold text-emerald-700">₹{result.insights.total_income_logged}</p>
+                </div>
+                <div className="bg-rose-50 border border-rose-100 p-4 rounded-xl text-center">
+                  <p className="text-xs font-semibold text-rose-600 uppercase tracking-wide">Total Expense</p>
+                  <p className="text-2xl font-bold text-rose-700">₹{result.insights.total_expense_logged}</p>
                 </div>
               </div>
-            )}
 
-            {}
-            {result.context_source && (
-              <div className="flex items-center justify-center gap-2 text-xs text-slate-400">
-                <span className={`px-2 py-0.5 rounded-full font-semibold ${
-                  result.context_source === "WEB+RAG"
-                    ? "bg-green-100 text-green-700"
-                    : "bg-slate-100 text-slate-600"
-                }`}>
-                  {result.context_source === "WEB+RAG" ? "🌐 Live Gov Data + AI" : "📚 AI Knowledge Base"}
-                </span>
-                {result.sources_used && result.sources_used.length > 0 && (
-                  <span title={result.sources_used.join("\n")}>
-                    {result.sources_used.length} portal{result.sources_used.length > 1 ? "s" : ""} queried
-                  </span>
-                )}
-              </div>
-            )}
+              {result.transactions.length > 0 && (
+                <div className="space-y-3">
+                  <h3 className="text-sm font-bold text-slate-800">Detected Transactions</h3>
+                  <ul className="space-y-2">
+                    {result.transactions.map((t, idx) => (
+                      <li key={idx} className="flex items-center justify-between text-sm bg-slate-50 border border-slate-100 p-3 rounded-xl">
+                        <span className="font-medium text-slate-700 capitalize">{t.category}</span>
+                        <div className="flex items-center gap-3">
+                          <span className={`text-xs px-2 py-1 rounded-full font-semibold ${
+                            t.transaction_type === 'income' ? 'bg-emerald-100 text-emerald-700' :
+                            t.transaction_type === 'expense' ? 'bg-rose-100 text-rose-700' :
+                            'bg-violet-100 text-violet-700'
+                          }`}>
+                            {t.transaction_type.replace('_', ' ')}
+                          </span>
+                          <span className="font-bold">₹{t.amount}</span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
-            {result.pdf_url && <DownloadButton pdfUrl={result.pdf_url} />}
+              {result.insights.suggested_schemes.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                    🌟 Suggested Schemes
+                  </h3>
+                  <div className="space-y-3">
+                    {result.insights.suggested_schemes.map((scheme, idx) => (
+                      <div key={idx} className="bg-gradient-to-r from-indigo-50 to-blue-50 border border-indigo-100 p-4 rounded-xl">
+                        <h4 className="font-bold text-indigo-900 text-sm mb-1">{scheme.scheme_name}</h4>
+                        <p className="text-xs text-indigo-700">{scheme.reason}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+            </div>
 
             <button
               onClick={handleReset}
               className="w-full py-3 rounded-2xl text-sm font-semibold text-slate-500 border border-slate-200 bg-white hover:bg-slate-50 transition-colors"
             >
-              ← Try Another Issue
+              ← Log Another Entry
             </button>
           </>
         )}
 
-        {}
         <footer className="text-center text-xs text-slate-400 pb-4 space-y-1">
-          <p>Project Nyaya is not a law firm and does not provide legal counsel.</p>
-          <p>In emergencies: Police <strong>100</strong> · Women Helpline <strong>181</strong></p>
+          <p>Financial Logic Engine powered by Llama 3.3</p>
         </footer>
       </div>
-
-      {}
-      {showForm && result && (
-        <FormCollector
-          intent={result.intent_detected}
-          transcribedText={result.transcribed_text}
-          onClose={() => setShowForm(false)}
-        />
-      )}
     </main>
   );
 }

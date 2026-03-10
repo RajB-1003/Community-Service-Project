@@ -6,20 +6,33 @@ import { useRef, useState, useEffect } from "react";
 
 type Status = "idle" | "recording" | "loading";
 
+interface Scheme {
+  scheme_name: string;
+  reason: string;
+}
+
+interface Transaction {
+  transaction_type: string;
+  amount: number;
+  category: string;
+}
+
+interface Insights {
+  total_income_logged: number;
+  total_expense_logged: number;
+  debt_risk_flag: boolean;
+  alert_message: string | null;
+  suggested_schemes: Scheme[];
+}
+
+interface FinancialResult {
+  transactions: Transaction[];
+  insights: Insights;
+  transcribed_text?: string;
+}
+
 interface MicButtonProps {
-  onResult: (data: {
-    intent_detected: string;
-    kill_switch_triggered: boolean;
-    simplified_explanation: string;
-    relevant_acts: string[];
-    immediate_action_steps: string[];
-    extracted_user_issue: string;
-    follow_up_question: string;
-    transcribed_text: string;
-    pdf_url: string;
-    context_source?: string;
-    sources_used?: string[];
-  }) => void;
+  onResult: (data: FinancialResult) => void;
   onError: (msg: string) => void;
 }
 
