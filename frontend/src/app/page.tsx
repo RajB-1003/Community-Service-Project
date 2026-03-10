@@ -80,11 +80,9 @@ export default function Home() {
       <div className="max-w-md mx-auto space-y-6">
 
         <header className="text-center space-y-2">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-green-600 to-emerald-700 shadow-lg mb-2">
-            <Scale className="w-7 h-7 text-white" />
-          </div>
+          
           <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">
-            Ayyampalayam <span className="text-emerald-600">Economy</span>
+            Rural Finance <span className="text-emerald-600">Advisor</span>
           </h1>
           <p className="text-sm text-slate-500 max-w-xs mx-auto leading-relaxed">
             Log financial transactions via text or voice, track debt, and find government schemes.
@@ -103,7 +101,7 @@ export default function Home() {
                     : "bg-white text-slate-500 hover:bg-slate-50"
                 }`}
               >
-                ✏ Type Issue
+                Type Issue
               </button>
               <button
                 onClick={() => setInputMode("mic")}
@@ -113,14 +111,14 @@ export default function Home() {
                     : "bg-white text-slate-500 hover:bg-slate-50"
                 }`}
               >
-                🎙 Speak Issue
+                Speak Issue
               </button>
             </div>
 
             {inputMode === "text" && (
               <div className="space-y-3">
                 <label className="block text-sm font-semibold text-slate-700">
-                  Describe your legal situation
+                  Log Your Daily Expense
                 </label>
                 <textarea
                   id="legal-issue-input"
@@ -128,9 +126,9 @@ export default function Home() {
                   className="w-full border border-slate-200 rounded-xl px-4 py-3 text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-none"
                   placeholder={
                     "Examples:\n" +
-                    "• I want to file an RTI about my pension. My name is Ravi Kumar.\n" +
-                    "• My husband is beating me, I need a protection order.\n" +
-                    "• My wife and I want a mutual divorce, married in 2019."
+                    "* Iniku velaiku Poi 500 rupa Sambarichen \n" +
+                    "* Maligai Saman Selavu 200 rupa\n" +
+                    "* Ponnu School Selavuku 500 rupa Kaasu kuduthen"
                   }
                   value={textInput}
                   onChange={(e) => setTextInput(e.target.value)}
@@ -153,7 +151,7 @@ export default function Home() {
                     "Analyse My Situation →"
                   )}
                 </button>
-                <p className="text-xs text-slate-400 text-center">Ctrl + Enter to submit</p>
+                {/* <p className="text-xs text-slate-400 text-center">Ctrl + Enter to submit</p> */}
               </div>
             )}
 
@@ -162,7 +160,7 @@ export default function Home() {
                 <MicButton onResult={handleResult} onError={handleError} />
                 <p className="text-xs text-slate-400 text-center">
                   Speak in Tanglish, Tamil, or English.
-                  <br />Whisper will translate automatically.
+                  <br />we will translate automatically.
                 </p>
               </div>
             )}
@@ -264,9 +262,9 @@ export default function Home() {
           </>
         )}
 
-        <footer className="text-center text-xs text-slate-400 pb-4 space-y-1">
+        {/* <footer className="text-center text-xs text-slate-400 pb-4 space-y-1">
           <p>Financial Logic Engine powered by Llama 3.3</p>
-        </footer>
+        </footer> */}
       </div>
     </main>
   );
