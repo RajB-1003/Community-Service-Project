@@ -1,11 +1,14 @@
+# Core (required)
 fastapi
 uvicorn[standard]
 python-multipart
-groq
-fpdf2
-pydantic
 python-dotenv
-chromadb
-httpx
-beautifulsoup4
-lxml
+pydantic
+
+# Streamlit UI (app.py)
+streamlit
+requests
+
+# Optional: only needed for POST /api/process (audio → Whisper transcription)
+# Remove if running fully offline / text-only mode
+groq

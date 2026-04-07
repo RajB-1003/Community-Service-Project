@@ -1,50 +1,104 @@
-
 """
-Project Nyaya — FastAPI Backend v5.0
-Voice-first legal triage for marginalized communities.
+main.py — Project Nyaya Financial Advisor  v7.0
+Voice-first micro-finance advisor for rural Tamil Nadu users.
 
-Context retrieval pipeline (priority order):
-  1. Live web fetch from official Indian government portals (httpx, async, 6s timeout)
-  2. ChromaDB semantic search (ONNXMiniLM-L6-v2) — fallback if web fetch returns < 300 chars
-  3. Both sources are fused when web fetch succeeds, so the LLM gets the richest possible context
+New in v7.0:
+  ✓ financial_insights block in AnalyzeResponse (selective — LOG/SCHEME only)
+  ✓ has_insights: bool flag on every response
+  ✓ POST /api/goal      — create / replace a savings goal
+  ✓ GET  /api/insights  — full financial snapshot on demand
+  ✓ decide() called with expense_total for savings calculation
+  ✓ set_goal intent → goal_hint (safe — never writes to DB directly)
+
+Routes
+------
+POST /api/analyze           → text input  → AnalyzeResponse (with financial_insights)
+POST /api/followup          → multi-turn second turn
+POST /api/process           → audio input → AnalyzeResponse
+POST /api/goal              → set savings goal → SetGoalResponse      [NEW v7.0]
+GET  /api/insights          → full financial snapshot                 [NEW v7.0]
+GET  /api/history           → recent transactions
+GET  /api/summary           → monthly totals
+GET  /api/health            → health probe
 """
 
-import asyncio
+from __future__ import annotations
+
+import logging
+import math
 import os
-import uuid
-import json
-import tempfile
+import traceback
+from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
-import chromadb
-from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
-from groq import Groq
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
-                                                                             
-           
-                                                                             
+from models import (
+    AnalyzeRequest, AnalyzeResponse, FollowUpRequest,
+    FinancialInsights, GoalInsight, PredictionInsight,
+    SetGoalRequest, SetGoalResponse,
+    InsightsResponse,
+    TransactionRecord, MonthlySummary,
+)
+from nlu import parse
+from decision_engine import decide
+from financial_engine import (
+    monthly_summary,
+    predict_expense,
+    calculate_savings,
+    goal_plan,
+    enhanced_scheme,
+)
+from db import (
+    init_db, insert_transaction,
+    get_recent_transactions, is_db_connected, touch_user,
+    upsert_goal, get_goal,
+)
+from audio import validate_audio, transcribe
+from session_store import (
+    get_session, set_session, clear_session, PendingSession, pending_count,
+)
+from rate_limiter import check_rate_limit
+
+# ─── Logging Setup ────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("main")
+
+# ─── Config ───────────────────────────────────────────────────────────────────
 
 load_dotenv()
-DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not DEMO_MODE and not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is not set. Add it to .env or set DEMO_MODE=true.")
-
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-BASE_DIR = Path(__file__).parent
+BASE_DIR   = Path(__file__).parent
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Rural Finance Advisor")
+# ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(
+    title="Rural Finance Advisor — Nyaya v7.0",
+    description=(
+        "Deterministic, offline-friendly voice-first financial advisor "
+        "for rural Tamil Nadu. Rule-based NLU + financial intelligence. No LLM."
+    ),
+    version="7.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,407 +110,539 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-                                                                             
-                                      
-                                                                             
-                                                                       
-                                                                             
-                                                                             
 
-_chroma_client = chromadb.Client()
-_embed_fn = ONNXMiniLM_L6_V2()
+# ─── Tamil Error Responses ────────────────────────────────────────────────────
 
-SCHEME_CHUNKS = [
-    {
-        "id": "scheme_km_urimai",
-        "topic": "Income & Ration",
-        "section": "Kalaignar Magalir Urimai Thittam",
-        "text": (
-            "Kalaignar Magalir Urimai Thittam: "
-            "A Tamil Nadu state scheme providing ₹1000/month to eligible women. "
-            "Eligibility Criteria: "
-            "1. Family annual income must be below ₹2.5 lakhs (approx. ₹20,833/month). "
-            "So if a user's monthly income is less than ₹8000/month, they easily qualify. "
-            "2. Users who mention possessing a 'Ration Card' or 'BPL card' are also generally eligible. "
-            "3. Intended to support women head of families to improve livelihood."
-        ),
-    },
-    {
-        "id": "scheme_ssy",
-        "topic": "Education & Girl Child",
-        "section": "Sukanya Samriddhi Yojana (SSY)",
-        "text": (
-            "Sukanya Samriddhi Yojana (SSY): "
-            "A Government of India backed saving scheme targeted at the parents of girl children. "
-            "Eligibility Criteria: "
-            "1. The user must have a daughter / girl child. "
-            "2. Whenever a user mentions a 'daughter', 'ponnu', 'girl child', or paying for 'school fees' for a girl. "
-            "Benefits: "
-            "High interest rate scheme at the Post Office. It builds a fund for the girl's education and marriage."
-        ),
-    },
-    {
-        "id": "scheme_po_rd",
-        "topic": "Savings",
-        "section": "Post Office Recurring Deposit (RD)",
-        "text": (
-            "Post Office Recurring Deposit (RD): "
-            "A safe investment for rural and low-income individuals to build a saving habit. "
-            "Eligibility Criteria: "
-            "1. Any individual with zero or manageable debt. "
-            "2. If a user logs Income but has ZERO Debt (no loans, no vaddi). "
-            "Benefits: "
-            "You can start an RD with as little as ₹100 per month at the nearest Post Office."
-        ),
-    },
-    {
-        "id": "risk_informal_debt",
-        "topic": "Debt & Risk",
-        "section": "Informal Debt Risk",
-        "text": (
-            "Informal Debt and 'Kandu Vaddi': "
-            "Rural economies often suffer from predatory lending (kandu vaddi, meter vaddi, informal loans). "
-            "Risk Triggers: "
-            "1. If the user mentions paying 'vaddi', 'kandu vaddi', 'chit fund', 'loan', 'kadan', 'meter vaddi', etc. "
-            "Action Required: "
-            "Set the 'debt_risk_flag' to true and issue a critical warning in simple Tanglish/English about the dangers of informal high-interest debt."
-        ),
-    },
-]
-
-                                                                             
-                                                        
-                                                                             
+_ERR_SYSTEM  = "System thappu. Konjam wait panni marubadi try panunga."
+_ERR_INVALID = "Request sari illai. Marubadi try panunga."
 
 
-def _build_vector_store() -> chromadb.Collection:
-    """Embed all scheme chunks and store in an in-memory ChromaDB collection."""
-    try:
-        _chroma_client.delete_collection("nyaya_financial")
-    except Exception:
-        pass
+# ─── Financial Insights Builder ───────────────────────────────────────────────
 
-    collection = _chroma_client.create_collection(
-        name="nyaya_financial",
-        embedding_function=_embed_fn,
-        metadata={"hnsw:space": "cosine"},
-    )
-    collection.add(
-        ids=[c["id"] for c in SCHEME_CHUNKS],
-        documents=[c["text"] for c in SCHEME_CHUNKS],
-        metadatas=[{"topic": c["topic"], "section": c["section"]} for c in SCHEME_CHUNKS],
-    )
-    return collection
-
-
-                                                                         
-_collection: chromadb.Collection = _build_vector_store()
-
-
-def semantic_retrieve(query: str, n_results: int = 4) -> str:
+def _build_insights(user_id: str, text: str, income: int, expense: int, debt: int) -> FinancialInsights:
     """
-    Embed the user's query and return the top-n most semantically relevant
-    legal chunk texts, joined together as a single context string.
+    Build a FinancialInsights Pydantic model for a given user.
+
+    Called ONLY when action is 'log' or 'scheme' (selective computation).
+    All sub-functions are safe (never raise).
     """
-    results = _collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        include=["documents", "metadatas"],
+    savings = income - expense
+
+    # Savings
+    sav_data = calculate_savings(user_id)
+
+    # Prediction
+    pred_data = predict_expense(user_id)
+    prediction = PredictionInsight(
+        status      = pred_data.get("status", "insufficient_data"),
+        predicted   = pred_data.get("predicted", 0),
+        daily_avg   = pred_data.get("daily_avg", 0),
+        active_days = pred_data.get("active_days", 0),
+        message     = pred_data.get("message", ""),
     )
-    docs = results["documents"][0]                             
-    metas = results["metadatas"][0]                               
-    context_parts = []
-    for doc, meta in zip(docs, metas):
-        context_parts.append(f"[{meta['topic']} — {meta['section']}]\n{doc}")
-    return "\n\n".join(context_parts)
 
+    # Goal
+    gp_data = goal_plan(user_id)
+    goal = GoalInsight(
+        status         = gp_data.get("status", "no_goal"),
+        target         = gp_data.get("target", 0),
+        duration_days  = gp_data.get("duration_days", 100),
+        progress       = gp_data.get("progress", 0),
+        daily_required = gp_data.get("daily_required", 0),
+        percent        = gp_data.get("percent", 0),
+        message        = gp_data.get("message", ""),
+    )
 
-                                                                             
-                  
-                                                                             
-
-AUDIO_MIME_MAP = {
-    ".webm": "audio/webm",
-    ".mp3":  "audio/mpeg",
-    ".mp4":  "audio/mp4",
-    ".wav":  "audio/wav",
-    ".ogg":  "audio/ogg",
-    ".flac": "audio/flac",
-    ".m4a":  "audio/mp4",
-}
-
-
-def get_mime_type(suffix: str) -> str:
-    return AUDIO_MIME_MAP.get(suffix.lower(), "audio/webm")
-
-
-                                                                             
-                                           
-                                                                             
-
-DEMO_RESPONSES = {
-    "Financial": {
-        "transactions": [
-            {
-                "transaction_type": "income",
-                "amount": 600,
-                "category": "tailoring"
-            },
-            {
-                "transaction_type": "debt_repayment",
-                "amount": 300,
-                "category": "vaddi"
-            },
-            {
-                "transaction_type": "expense",
-                "amount": 0,
-                "category": "school fee"
-            }
-        ],
-        "insights": {
-            "total_income_logged": 600,
-            "total_expense_logged": 0,
-            "debt_risk_flag": True,
-            "alert_message": "Vaddi katradhu ungaluku romba risk. Meter vaddi kaaranga kitta irundhu vilagi irunga, idhu unga valkaiya paadhikum.",
-            "suggested_schemes": [
-                {
-                    "scheme_name": "Kalaignar Magalir Urimai Thittam",
-                    "reason": "Since your logged income is likely below ₹8000/month, you might qualify for ₹1000 monthly."
-                },
-                {
-                    "scheme_name": "Sukanya Samriddhi Yojana (SSY)",
-                    "reason": "You mentioned paying for your daughter's school fees. Open an SSY account at the Post Office to save for her future."
-                }
-            ]
-        }
+    # Enhanced schemes
+    ctx = {
+        "text":       text,
+        "income":     income,
+        "expense":    expense,
+        "savings":    savings,
+        "debt_total": debt,
     }
-}
+    schemes = enhanced_scheme(user_id, ctx)
 
-def _demo_process(intent_key: str = "Financial") -> dict:
-    return DEMO_RESPONSES["Financial"]
-
-
-                                                                             
-                  
-                                                                             
-
-
-class AnalyzeRequest(BaseModel):
-    text: str
-
-class Transaction(BaseModel):
-    transaction_type: str = Field(description="One of: 'income', 'expense', or 'debt_repayment'")
-    amount: int
-    category: str = Field(description="Standardized english string for the category")
-
-class Scheme(BaseModel):
-    scheme_name: str
-    reason: str
-
-class Insights(BaseModel):
-    total_income_logged: int
-    total_expense_logged: int
-    debt_risk_flag: bool
-    alert_message: str | None
-    suggested_schemes: List[Scheme]
-
-class IntentResult(BaseModel):
-    transactions: List[Transaction]
-    insights: Insights
-
-
-                                                                             
-                     
-                                                                             
-
-
-SYSTEM_PROMPT = """You are the backend financial logic engine for a rural micro-economy application in Tamil Nadu (Ayyampalayam). 
-Your objective is to analyze raw, typed text input (informal Tamil, Tanglish, or English) from a user, extract financial transactions, and output deterministic financial alerts and scheme matching.
-
-RULES OF ENGAGEMENT:
-1. NO CHAT: You do not converse. You output ONLY strictly valid JSON. No markdown wrappers outside the JSON structure.
-2. TYPO RESILIENCE: Users will type in Tanglish with heavy spelling variations (e.g., "selavu", "selvu", "vadi", "vaddi", "kooli", "koolee"). Parse the intent regardless of spelling.
-3. LOCAL ECONOMY MAPPING:
-   - "vaddi", "kandu vaddi", "chit fund", "loan", "kadan" -> type: "debt_repayment"
-   - "coolie", "100-day work", "mgnrega", "tailoring", "business" -> type: "income"
-   - "groceries", "school fee", "ration", "hospital" -> type: "expense"
-4. DETERMINISTIC LOGIC ENGINE:
-   - If Income < ₹8000/month or user mentions "ration card": Suggest "Kalaignar Magalir Urimai Thittam" (₹1000/month).
-   - If user mentions daughter/girl child/school fees: Suggest "Sukanya Samriddhi Yojana (SSY)" at the Post Office.
-   - If user logs Income but ZERO Debt: Suggest "Post Office Recurring Deposit (RD) - start with ₹100".
-   - If user logs "vaddi", "kandu vaddi" or informal debt: Set "debt_risk_flag" to true and issue a critical warning in simple Tanglish/English in alert_message.
-
-JSON SCHEMA REQUIREMENT:
-{
-  "transactions": [
-    {
-      "transaction_type": "income" | "expense" | "debt_repayment",
-      "amount": <integer>,
-      "category": "<standardized english string>"
-    }
-  ],
-  "insights": {
-    "total_income_logged": <integer>,
-    "total_expense_logged": <integer>,
-    "debt_risk_flag": <boolean>,
-    "alert_message": "<String in simple Tanglish/English if risk is true, else null>",
-    "suggested_schemes": [
-      {
-        "scheme_name": "<Name of Scheme>",
-        "reason": "<Why they qualify>"
-      }
-    ]
-  }
-}
-"""
-
-
-async def _call_groq_analyze(text: str) -> IntentResult:
-    """
-    RAG-fallback context pipeline:
-      1. Run ChromaDB semantic search to get top-3 relevant financial/scheme chunks.
-      2. Call Groq Llama 3.3-70b with the context.
-    """
-    rag_context = semantic_retrieve(text, n_results=3)
-
-    fused_context = (
-        "=== CONTEXT FROM FINANCIAL SCHEME KNOWLEDGE BASE ===\n"
-        f"{rag_context}"
+    return FinancialInsights(
+        savings          = savings,
+        income           = income,
+        expense          = expense,
+        savings_status   = sav_data.get("savings_status", "no_income"),
+        savings_message  = sav_data.get("message", ""),
+        prediction       = prediction,
+        goal             = goal,
+        schemes          = schemes,
     )
 
-    prompt = (
-        f'User\'s statement (translated to English if necessary): "{text}"\n\n'
-        f"Context to use for scheme matching:\n"
-        f"{fused_context}\n\n"
-        f"Produce a specific, legally precise JSON response for this user's exact financial situation."
+
+# ─── Core Analysis Pipeline ───────────────────────────────────────────────────
+
+def _run_analysis(text: str, user_id: str) -> AnalyzeResponse:
+    """
+    Shared inner pipeline: NLU → DB fetch → DB insert → Decide → Response.
+
+    v7.0 changes:
+    - expense_total passed to decide() for savings calculation
+    - financial_insights built and attached when action is 'log' or 'scheme'
+    - set_goal intent short-circuits to goal_hint (no insert, no insights)
+    - has_insights flag set correctly
+    """
+    touch_user(user_id)
+
+    # ── Step 1: NLU ──────────────────────────────────────────────────────────
+    parsed = parse(text)
+    log.info(
+        "ANALYZE | user=%s input=%r → intent=%s cat=%s amt=%d conf=%s",
+        user_id, text, parsed.intent, parsed.category, parsed.amount, parsed.confidence,
     )
 
-    response = await asyncio.to_thread(
-        groq_client.chat.completions.create,
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
+    # ── Step 2: Current month totals (pre-insert) ────────────────────────────
+    summary      = monthly_summary(user_id)
+    income_total = int(summary.get("income_total",  0))
+    expense_total= int(summary.get("expense_total", 0))
+    debt_total   = int(summary.get("debt_total",    0))
+    log.debug("PRE-INSERT TOTALS | user=%s income=%d expense=%d debt=%d",
+              user_id, income_total, expense_total, debt_total)
+
+    # ── Step 3: Decide (before insert, so followup/goal_hint short-circuit) ──
+    decision = decide(
+        text             = text,
+        intent           = parsed.intent,
+        category         = parsed.category,
+        amount           = parsed.amount,
+        user_id          = user_id,
+        income_total     = income_total,
+        debt_total       = debt_total,
+        confidence       = parsed.confidence,
+        missing_amount   = parsed.missing_amount,
+        missing_category = parsed.missing_category,
+        expense_total    = expense_total,
     )
-    raw = response.choices[0].message.content
-    data = json.loads(raw)
 
-    return IntentResult(**data)
+    # ── Fast-path: followup / goal_hint / retry / alert ──────────────────────
+    if decision.action in ("followup", "goal_hint", "retry", "alert"):
+        if decision.action == "followup":
+            if parsed.missing_amount:
+                set_session(PendingSession(
+                    user_id  = user_id,
+                    status   = "WAITING_FOR_AMOUNT",
+                    intent   = parsed.intent,
+                    category = parsed.category,
+                    tx_date  = parsed.tx_date,
+                ))
+                log.info("SESSION | user=%s → WAITING_FOR_AMOUNT (intent=%s cat=%s)",
+                         user_id, parsed.intent, parsed.category)
+            elif parsed.missing_category:
+                set_session(PendingSession(
+                    user_id  = user_id,
+                    status   = "WAITING_FOR_CATEGORY",
+                    amount   = parsed.amount,
+                    tx_date  = parsed.tx_date,
+                ))
+                log.info("SESSION | user=%s → WAITING_FOR_CATEGORY (amt=%d)",
+                         user_id, parsed.amount)
 
+        return AnalyzeResponse(
+            text           = text,
+            intent         = parsed.intent,
+            category       = parsed.category,
+            amount         = parsed.amount,
+            response       = decision.response,
+            action         = decision.action,
+            confidence     = parsed.confidence,
+            needs_followup = decision.needs_followup,
+            has_insights   = False,
+            # financial_insights defaults to empty FinancialInsights()
+        )
 
-                                                                             
-             
-                                                                             
-@app.post("/api/analyze", response_model=IntentResult)
-async def analyze(request: AnalyzeRequest):
-    try:
-        return await _call_groq_analyze(request.text)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"JSON parse error: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq analysis error: {exc}") from exc
+    # ── Step 4: Persist — only when amount > 0 and intent is actionable ──────
+    inserted_row = 0
+    if parsed.amount > 0 and parsed.intent not in ("unknown", "set_goal"):
+        inserted_row = insert_transaction(
+            user_id  = user_id,
+            amount   = parsed.amount,
+            tx_type  = parsed.intent,
+            category = parsed.category,
+            tx_date  = parsed.tx_date,
+        )
+    elif parsed.amount > 0 and parsed.intent == "unknown":
+        inserted_row = insert_transaction(
+            user_id  = user_id,
+            amount   = parsed.amount,
+            tx_type  = "expense",
+            category = parsed.category,
+            tx_date  = parsed.tx_date,
+        )
+        log.warning("FALLBACK INSERT | user=%s amt=%d as expense (intent=unknown)",
+                    user_id, parsed.amount)
 
+    # Refresh totals after insert
+    if inserted_row:
+        summary       = monthly_summary(user_id)
+        income_total  = int(summary.get("income_total",  0))
+        expense_total = int(summary.get("expense_total", 0))
+        debt_total    = int(summary.get("debt_total",    0))
+        log.info("POST-INSERT TOTALS | user=%s income=%d expense=%d debt=%d",
+                 user_id, income_total, expense_total, debt_total)
 
-@app.post("/api/process")
-async def process(audio: UploadFile = File(...)):
-    """
-    Full pipeline: audio → Whisper → semantic retrieval → Llama analysis.
-    Set DEMO_MODE=true in .env to bypass all API calls.
-    """
-    if DEMO_MODE:
-        demo = _demo_process("Financial")
-        return JSONResponse({**demo, "transcribed_text": "[DEMO] I earned 600 from tailoring, and paid 300 vaddi."})
+    # ── Step 5: Build financial_insights (only for log / scheme actions) ─────
+    has_insights = decision.action in ("log", "scheme") and inserted_row > 0
+    insights_model = FinancialInsights()
 
-    suffix = Path(audio.filename or "audio.webm").suffix or ".webm"
-    tmp_path = Path(tempfile.mktemp(suffix=suffix))
-    try:
-        tmp_path.write_bytes(await audio.read())
-        with open(tmp_path, "rb") as f:
-            whisper_resp = groq_client.audio.translations.create(
-                file=(tmp_path.name, f.read()),
-                model="whisper-large-v3",
-                response_format="text",
+    if has_insights:
+        try:
+            insights_model = _build_insights(
+                user_id = user_id,
+                text    = text,
+                income  = income_total,
+                expense = expense_total,
+                debt    = debt_total,
             )
-        text = str(whisper_resp).strip()
+        except Exception as exc:
+            log.warning("Insights build failed (non-fatal): %s", exc)
+            has_insights = False
+
+    log.info("RESPONSE | user=%s action=%s has_insights=%s response=%r",
+             user_id, decision.action, has_insights, decision.response[:60])
+
+    return AnalyzeResponse(
+        text                = text,
+        intent              = parsed.intent,
+        category            = parsed.category,
+        amount              = parsed.amount,
+        response            = decision.response,
+        action              = decision.action,
+        confidence          = parsed.confidence,
+        needs_followup      = decision.needs_followup,
+        has_insights        = has_insights,
+        financial_insights  = insights_model,
+    )
+
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.post("/api/analyze", response_model=AnalyzeResponse, tags=["core"])
+async def analyze(request: AnalyzeRequest):
+    """
+    **Primary text input route.**
+
+    Accepts Tamil / Tanglish / English text.
+    Returns deterministic financial analysis.
+
+    When action = 'goal_hint': user mentioned a savings goal; redirect them
+    to POST /api/goal to create it with a specific target and duration.
+
+    When has_insights = true: the financial_insights block contains prediction,
+    savings calculation, goal progress and scheme suggestions.
+
+    Example:
+    ```json
+    { "text": "kooli 800 vandhuchu", "user_id": "user_42" }
+    ```
+    """
+    check_rate_limit(request.user_id)
+    try:
+        return _run_analysis(request.text, request.user_id)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq transcription error: {exc}") from exc
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=_ERR_SYSTEM) from exc
+
+
+@app.post("/api/followup", response_model=AnalyzeResponse, tags=["core"])
+async def followup(request: FollowUpRequest):
+    """
+    **Multi-turn second-turn input.**
+
+    Call when a previous /api/analyze returned action='followup'.
+    If no pending session exists, treats the input as a fresh analysis.
+    """
+    check_rate_limit(request.user_id)
+
+    session = get_session(request.user_id)
+    if session is None:
+        try:
+            return _run_analysis(request.text, request.user_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=_ERR_SYSTEM) from exc
+
+    touch_user(request.user_id)
+    parsed = parse(request.text)
+
+    # ── WAITING_FOR_AMOUNT ─────────────────────────────────────────────────
+    if session.status == "WAITING_FOR_AMOUNT":
+        amount = parsed.amount if parsed.amount > 0 else 0
+        if amount == 0:
+            log.info("FOLLOWUP | user=%s still no amount in %r", request.user_id, request.text)
+            return AnalyzeResponse(
+                text           = request.text,
+                intent         = session.intent or "unknown",
+                category       = session.category or "Other",
+                amount         = 0,
+                response       = "Evlo rupees? Thozhil amount sollunga. (e.g. 500)",
+                action         = "followup",
+                confidence     = "LOW",
+                needs_followup = True,
+                has_insights   = False,
+            )
+
+        effective_intent   = session.intent   or "expense"
+        effective_category = session.category or "Other"
+        clear_session(request.user_id)   # clear before insert (duplicate guard)
+        log.info("FOLLOWUP COMPLETE | user=%s intent=%s cat=%s amt=%d",
+                 request.user_id, effective_intent, effective_category, amount)
+        insert_transaction(
+            user_id  = request.user_id,
+            amount   = amount,
+            tx_type  = effective_intent,
+            category = effective_category,
+            tx_date  = session.tx_date,
+        )
+        summary       = monthly_summary(request.user_id)
+        income_total  = int(summary.get("income_total",  0))
+        expense_total = int(summary.get("expense_total", 0))
+        debt_total    = int(summary.get("debt_total",    0))
+        decision = decide(
+            text=request.text, intent=effective_intent, category=effective_category,
+            amount=amount, user_id=request.user_id,
+            income_total=income_total, debt_total=debt_total,
+            expense_total=expense_total,
+        )
+        # Build insights for completed followup transactions
+        insights_model = FinancialInsights()
+        has_insights   = decision.action in ("log", "scheme")
+        if has_insights:
+            try:
+                insights_model = _build_insights(
+                    user_id=request.user_id, text=request.text,
+                    income=income_total, expense=expense_total, debt=debt_total,
+                )
+            except Exception:
+                has_insights = False
+
+        return AnalyzeResponse(
+            text=request.text, intent=effective_intent,
+            category=effective_category, amount=amount,
+            response=decision.response, action=decision.action,
+            confidence="HIGH", needs_followup=False,
+            has_insights=has_insights, financial_insights=insights_model,
+        )
+
+    # ── WAITING_FOR_CATEGORY ───────────────────────────────────────────────
+    if session.status == "WAITING_FOR_CATEGORY":
+        amount           = session.amount or parsed.amount or 0
+        category         = parsed.category if parsed.category != "Other" else "Other"
+        effective_intent = parsed.intent   if parsed.intent != "unknown" else "expense"
+        clear_session(request.user_id)
+        log.info("FOLLOWUP CATEGORY | user=%s intent=%s cat=%s amt=%d",
+                 request.user_id, effective_intent, category, amount)
+        insert_transaction(
+            user_id  = request.user_id,
+            amount   = amount,
+            tx_type  = effective_intent,
+            category = category,
+            tx_date  = session.tx_date,
+        )
+        summary       = monthly_summary(request.user_id)
+        income_total  = int(summary.get("income_total",  0))
+        expense_total = int(summary.get("expense_total", 0))
+        debt_total    = int(summary.get("debt_total",    0))
+        decision = decide(
+            text=request.text, intent=effective_intent, category=category,
+            amount=amount, user_id=request.user_id,
+            income_total=income_total, debt_total=debt_total,
+            expense_total=expense_total,
+        )
+        insights_model = FinancialInsights()
+        has_insights   = decision.action in ("log", "scheme")
+        if has_insights:
+            try:
+                insights_model = _build_insights(
+                    user_id=request.user_id, text=request.text,
+                    income=income_total, expense=expense_total, debt=debt_total,
+                )
+            except Exception:
+                has_insights = False
+
+        return AnalyzeResponse(
+            text=request.text, intent=effective_intent,
+            category=category, amount=amount,
+            response=decision.response, action=decision.action,
+            confidence="HIGH", needs_followup=False,
+            has_insights=has_insights, financial_insights=insights_model,
+        )
+
+    # Fallback — unexpected session state
+    clear_session(request.user_id)
+    return AnalyzeResponse(
+        text=request.text, intent="unknown", category="Other", amount=0,
+        response="Puriyala, marubadi sollunga.",
+        action="retry", confidence="NONE", needs_followup=False,
+        has_insights=False,
+    )
+
+
+@app.post("/api/process", response_model=AnalyzeResponse, tags=["core"])
+async def process(
+    audio: UploadFile = File(...),
+    user_id: str = Query(default="default", max_length=64),
+):
+    """
+    **Audio input route.**
+
+    Accepts WAV (preferred), WebM, OGG, MP3.
+    Max file size: 5 MB. Requires GROQ_API_KEY for Whisper transcription.
+    """
+    check_rate_limit(user_id)
+    data = await audio.read()
+    wav_data = validate_audio(data)
+    text = transcribe(wav_data)
 
     try:
-        result = await _call_groq_analyze(text)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"JSON parse error: {exc}") from exc
+        return _run_analysis(text, user_id)
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq analysis error: {exc}") from exc
-
-    return JSONResponse({
-        **result.model_dump(),
-        "transcribed_text": text
-    })
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=_ERR_SYSTEM) from exc
 
 
-                                                                             
-                                                             
-                                                                             
+# ─── NEW: POST /api/goal ──────────────────────────────────────────────────────
 
-
-@app.get("/api/debug/retrieve")
-async def debug_retrieve(q: str, n: int = 4):
+@app.post("/api/goal", response_model=SetGoalResponse, tags=["financial"])
+async def set_goal(request: SetGoalRequest):
     """
-    GET /api/debug/retrieve?q=my+husband+beats+me&n=4
-    Shows which legal chunks were semantically matched for a query.
-    Useful for testing and tuning retrieval quality.
+    **Create or replace a savings goal.**
+
+    The system stores one active goal per user (UNIQUE on user_id).
+    Submitting a new goal overwrites the previous one.
+
+    Returns:
+    - daily_required: ₹ per day the user must save to hit the target
+    - Tamil confirmation message
+
+    Example:
+    ```json
+    { "user_id": "user_42", "target_amount": 10000, "duration_days": 100 }
+    ```
     """
-    results = _collection.query(
-        query_texts=[q],
-        n_results=n,
-        include=["documents", "metadatas", "distances"],
+    try:
+        upsert_goal(
+            user_id       = request.user_id,
+            target_amount = request.target_amount,
+            duration_days = request.duration_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        log.error("Goal upsert failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=_ERR_SYSTEM) from exc
+
+    daily_req = math.ceil(request.target_amount / request.duration_days)
+    message = (
+        f"Goal set aachhu! 🎯 ₹{request.target_amount} target, "
+        f"{request.duration_days} naal la. "
+        f"Daily ₹{daily_req} save pannunga."
     )
+    log.info("GOAL SET | user=%s target=%d days=%d daily=%d",
+             request.user_id, request.target_amount, request.duration_days, daily_req)
+
+    return SetGoalResponse(
+        status        = "ok",
+        user_id       = request.user_id,
+        target_amount = request.target_amount,
+        duration_days = request.duration_days,
+        daily_required = daily_req,
+        message       = message,
+    )
+
+
+# ─── NEW: GET /api/insights ───────────────────────────────────────────────────
+
+@app.get("/api/insights", response_model=InsightsResponse, tags=["financial"])
+async def insights(user_id: str = Query(default="default", max_length=64)):
+    """
+    **Full financial snapshot for a user.**
+
+    Returns savings calculation, expense prediction, goal progress,
+    and enhanced scheme suggestions — all in a single call.
+
+    No text input required. Useful for dashboard polling / PWA home screen.
+    """
+    try:
+        sav_data  = calculate_savings(user_id)
+        pred_data = predict_expense(user_id)
+        gp_data   = goal_plan(user_id)
+
+        summary = monthly_summary(user_id)
+        ctx = {
+            "text":       "",
+            "income":     int(summary.get("income_total",  0)),
+            "expense":    int(summary.get("expense_total", 0)),
+            "savings":    sav_data.get("savings", 0),
+            "debt_total": int(summary.get("debt_total", 0)),
+        }
+        schemes = enhanced_scheme(user_id, ctx)
+
+        return InsightsResponse(
+            user_id    = user_id,
+            savings    = sav_data,
+            prediction = pred_data,
+            goal       = gp_data,
+            schemes    = schemes,
+        )
+    except Exception as exc:
+        log.error("Insights fetch failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=_ERR_SYSTEM) from exc
+
+
+# ─── Existing Routes (unchanged) ──────────────────────────────────────────────
+
+@app.get("/api/history", response_model=List[TransactionRecord], tags=["data"])
+async def history(
+    user_id: str = Query(default="default", max_length=64),
+    limit:   int = Query(default=30, ge=1, le=100),
+):
+    """Return the most recent transactions for a user (default last 30)."""
+    rows = get_recent_transactions(user_id=user_id, limit=limit)
+    return [TransactionRecord(**r) for r in rows]
+
+
+@app.get("/api/summary", response_model=MonthlySummary, tags=["data"])
+async def summary(user_id: str = Query(default="default", max_length=64)):
+    """Current-month income / expense / debt totals for a user."""
+    data = monthly_summary(user_id)
+    return MonthlySummary(
+        user_id           = user_id,
+        income_total      = int(data.get("income_total",      0)),
+        expense_total     = int(data.get("expense_total",     0)),
+        debt_total        = int(data.get("debt_total",        0)),
+        transaction_count = int(data.get("transaction_count", 0)),
+    )
+
+
+@app.get("/api/health", tags=["ops"])
+async def health():
+    """Health probe — DB status + active sessions + version."""
     return {
-        "query": q,
-        "retrieved": [
-            {
-                "rank": i + 1,
-                "topic": meta["topic"],
-                "section": meta["section"],
-                "distance": round(dist, 4),
-                "preview": doc[:200] + "...",
-            }
-            for i, (doc, meta, dist) in enumerate(zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0],
-            ))
-        ],
+        "status":           "ok",
+        "db":               "connected" if is_db_connected() else "error",
+        "version":          "7.0.0",
+        "mode":             "rule-based financial advisor (no LLM)",
+        "pending_sessions": pending_count(),
     }
 
 
-@app.get("/api/debug/sources")
-async def debug_sources(intent: str = None):
-    """
-    GET /api/debug/sources              → all intents
-    GET /api/debug/sources?intent=RTI   → specific intent
-    Shows all configured government portal URLs and which sources are tried per intent.
-    """
-    if intent:
-        sources = GOVERNMENT_SOURCES.get(intent, [])
-        return {
-            "intent": intent,
-            "configured_sources": [
-                {"url": s["url"], "label": s["label"]} for s in sources
-            ],
-        }
-    return {
-        "all_sources": {
-            topic: [{"url": s["url"], "label": s["label"]} for s in srcs]
-            for topic, srcs in GOVERNMENT_SOURCES.items()
-        }
-    }
+# ─── Global Exception Handler ─────────────────────────────────────────────────
 
-
-
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all: return Tamil-friendly 500 instead of raw Python traceback."""
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": _ERR_SYSTEM},
+    )
